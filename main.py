@@ -6,7 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
@@ -139,9 +139,185 @@ class QueryResponse(BaseModel):
     answer: str
     sources: List[str] = []
 
+class UploadResponse(BaseModel):
+    success: bool
+    message: str
+    file_name: Optional[str] = None
+
+class DocumentInfo(BaseModel):
+    name: str
+    display_name: str
+    size_bytes: Optional[int] = None
+    mime_type: Optional[str] = None
+    state: Optional[str] = None
+    create_time: Optional[str] = None
+    update_time: Optional[str] = None
+    
+    class Config:
+        json_encoders = {
+            int: str
+        }
+
+class ListFilesResponse(BaseModel):
+    documents: List[DocumentInfo]
+    total_count: int
+
+class DeleteFileResponse(BaseModel):
+    success: bool
+    message: str
+    document_name: str
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "rag_ready": app_state["ready"]}
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_file(file: UploadFile = File(...)):
+    """
+    Upload a file to the File Search store.
+    Strictly follows Google's File Search documentation.
+    """
+    if not app_state["ready"]:
+        raise HTTPException(status_code=503, detail="RAG system is not ready yet. Please wait.")
+    
+    client = app_state["client"]
+    store_name = app_state["store_name"]
+    
+    if not client or not store_name:
+        raise HTTPException(status_code=500, detail="RAG system configuration failed.")
+    
+    # Save uploaded file temporarily
+    temp_file_path = os.path.join("/tmp", file.filename)
+    try:
+        with open(temp_file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        logger.info(f"Uploading file: {file.filename} to store: {store_name}")
+        
+        # Strictly following documentation: upload_to_file_search_store
+        operation = client.file_search_stores.upload_to_file_search_store(
+            file=temp_file_path,
+            file_search_store_name=store_name,
+            config={'display_name': file.filename}
+        )
+        
+        logger.info(f"Upload operation initiated: {operation.name}")
+        
+        # Poll for completion as per documentation
+        while not operation.done:
+            time.sleep(2)
+            operation = client.operations.get(operation)
+        
+        # Check for errors
+        if operation.error:
+            logger.error(f"Error processing {file.filename}: {operation.error}")
+            raise HTTPException(status_code=500, detail=f"Upload failed: {operation.error}")
+        
+        logger.info(f"Successfully uploaded: {file.filename}")
+        
+        return UploadResponse(
+            success=True,
+            message=f"File {file.filename} uploaded successfully",
+            file_name=file.filename
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Exception during upload: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Clean up temporary file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+@app.get("/files/list", response_model=ListFilesResponse)
+def list_files():
+    """
+    List all documents in the File Search store.
+    Strictly follows Google's File Search documentation.
+    """
+    if not app_state["ready"]:
+        raise HTTPException(status_code=503, detail="RAG system is not ready yet. Please wait.")
+    
+    client = app_state["client"]
+    store_name = app_state["store_name"]
+    
+    if not client or not store_name:
+        raise HTTPException(status_code=500, detail="RAG system configuration failed.")
+    
+    try:
+        logger.info(f"Listing documents in store: {store_name}")
+        
+        # Strictly following documentation: list documents
+        documents = []
+        for document in client.file_search_stores.documents.list(parent=store_name):
+            documents.append(DocumentInfo(
+                name=document.name,
+                display_name=document.display_name or "Unknown",
+                size_bytes=document.size_bytes,
+                mime_type=document.mime_type,
+                state=document.state,
+                create_time=str(document.create_time) if document.create_time else None,
+                update_time=str(document.update_time) if document.update_time else None
+            ))
+        
+        logger.info(f"Found {len(documents)} documents in store")
+        
+        return ListFilesResponse(
+            documents=documents,
+            total_count=len(documents)
+        )
+        
+    except Exception as e:
+        logger.error(f"Error listing documents: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/files/delete/{document_id}", response_model=DeleteFileResponse)
+def delete_file(document_id: str):
+    """
+    Delete a specific document from the File Search store.
+    Strictly follows Google's File Search documentation.
+    
+    Args:
+        document_id: The document ID (not the full resource name)
+                    Example: 'the-doc-abc' from 'fileSearchStores/store-123/documents/the-doc-abc'
+    """
+    if not app_state["ready"]:
+        raise HTTPException(status_code=503, detail="RAG system is not ready yet. Please wait.")
+    
+    client = app_state["client"]
+    store_name = app_state["store_name"]
+    
+    if not client or not store_name:
+        raise HTTPException(status_code=500, detail="RAG system configuration failed.")
+    
+    try:
+        # Construct the full document name as per documentation
+        # Format: fileSearchStores/{store}/documents/{document}
+        document_name = f"{store_name}/documents/{document_id}"
+        
+        logger.info(f"Deleting document: {document_name}")
+        
+        # Strictly following documentation: delete document with force=True
+        # force=True will delete the document along with its chunks
+        client.file_search_stores.documents.delete(
+            name=document_name,
+            config={'force': True}
+        )
+        
+        logger.info(f"Successfully deleted document: {document_name}")
+        
+        return DeleteFileResponse(
+            success=True,
+            message=f"Document {document_id} deleted successfully",
+            document_name=document_name
+        )
+        
+    except Exception as e:
+        logger.error(f"Error deleting document {document_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/query", response_model=QueryResponse)
 def query_model(request: QueryRequest):
