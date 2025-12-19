@@ -5,11 +5,15 @@ import concurrent.futures
 import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional
+from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -68,7 +72,7 @@ def upload_and_monitor(client, file_path, store_name):
         return None
 
 def setup_rag_system():
-    """Initializes the RAG system: creates store and uploads files."""
+    """Initializes the RAG system: reuses existing store or creates new one."""
     api_key = get_api_key()
     if not api_key:
         logger.error("API Key missing. RAG system setup failed.")
@@ -78,49 +82,43 @@ def setup_rag_system():
     app_state["client"] = client
     logger.info("Client initialized.")
 
-    # 1. Create File Search Store
-    logger.info("Creating File Search Store...")
-    try:
-        file_search_store = client.file_search_stores.create(
-            config={'display_name': 'fastapi_knowledge_base'}
-        )
-        app_state["store_name"] = file_search_store.name
-        logger.info(f"Created store: {file_search_store.name}")
-    except Exception as e:
-        logger.error(f"Failed to create store: {e}")
-        return
-
-    # 2. List files
-    pdf_files = glob.glob(os.path.join(DOCUMENTS_DIR, "*.pdf"))
-    if not pdf_files:
-        logger.warning(f"No PDF files found in {DOCUMENTS_DIR}")
-        app_state["ready"] = True # Still ready, just empty
-        return
+    # Check if we have an existing store name in environment
+    existing_store_name = os.environ.get("FILE_SEARCH_STORE_NAME")
     
-    logger.info(f"Found {len(pdf_files)} PDF files.")
+    if existing_store_name:
+        try:
+            # Try to get the existing store
+            logger.info(f"Checking for existing store: {existing_store_name}")
+            file_search_store = client.file_search_stores.get(name=existing_store_name)
+            app_state["store_name"] = file_search_store.name
+            logger.info(f"Reusing existing store: {file_search_store.name}")
+            logger.info(f"Store has {file_search_store.active_documents_count} active documents")
+        except Exception as e:
+            logger.warning(f"Could not find existing store: {e}")
+            logger.info("Creating new store...")
+            existing_store_name = None
+    
+    # Create new store if we don't have one or couldn't find the existing one
+    if not existing_store_name:
+        try:
+            file_search_store = client.file_search_stores.create(
+                config={'display_name': 'fastapi_knowledge_base'}
+            )
+            app_state["store_name"] = file_search_store.name
+            logger.info(f"Created new store: {file_search_store.name}")
+            logger.info(f"⚠️  To reuse this store on restart, add to .env file:")
+            logger.info(f"FILE_SEARCH_STORE_NAME={file_search_store.name}")
+        except Exception as e:
+            logger.error(f"Failed to create store: {e}")
+            return
 
-    # 3. Upload Files (Parallelized)
-    successful_uploads = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_file = {
-            executor.submit(upload_and_monitor, client, f, file_search_store.name): f 
-            for f in pdf_files
-        }
-        
-        for future in concurrent.futures.as_completed(future_to_file):
-            result = future.result()
-            if result:
-                successful_uploads += 1
-
-    logger.info(f"Uploads complete. {successful_uploads}/{len(pdf_files)} files processed successfully.")
+    # Mark system as ready - files will be uploaded via /upload API
+    logger.info("RAG system ready. Use /upload endpoint to add documents.")
     app_state["ready"] = True
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup logic
-    # We run the setup in a separate thread or just block startup if it's critical.
-    # For simplicity in this example, we'll run it directly, but keep in mind 
-    # large uploads might block startup time.
+    # Startup logic - only creates the store, no file uploads
     logger.info("Starting up RAG system...")
     setup_rag_system()
     yield
@@ -166,6 +164,26 @@ class DeleteFileResponse(BaseModel):
     success: bool
     message: str
     document_name: str
+
+class StoreInfo(BaseModel):
+    name: str
+    display_name: str
+    active_documents_count: Optional[int] = None
+    pending_documents_count: Optional[int] = None
+    failed_documents_count: Optional[int] = None
+    size_bytes: Optional[int] = None
+    create_time: Optional[str] = None
+    update_time: Optional[str] = None
+
+class ListStoresResponse(BaseModel):
+    stores: List[StoreInfo]
+    total_count: int
+    current_store: Optional[str] = None
+
+class DeleteStoreResponse(BaseModel):
+    success: bool
+    message: str
+    store_name: str
 
 @app.get("/health")
 def health_check():
@@ -274,6 +292,82 @@ def list_files():
         logger.error(f"Error listing documents: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/stores/list", response_model=ListStoresResponse)
+def list_stores():
+    """
+    List all File Search stores associated with the account.
+    Strictly follows Google's File Search documentation.
+    """
+    if not app_state["client"]:
+        raise HTTPException(status_code=500, detail="Client not initialized.")
+    
+    client = app_state["client"]
+    
+    try:
+        logger.info("Listing all file search stores...")
+        
+        # Strictly following documentation: list all stores
+        stores = []
+        for store in client.file_search_stores.list():
+            stores.append(StoreInfo(
+                name=store.name,
+                display_name=store.display_name or "Unknown",
+                active_documents_count=store.active_documents_count,
+                pending_documents_count=store.pending_documents_count,
+                failed_documents_count=store.failed_documents_count,
+                size_bytes=store.size_bytes,
+                create_time=str(store.create_time) if store.create_time else None,
+                update_time=str(store.update_time) if store.update_time else None
+            ))
+        
+        logger.info(f"Found {len(stores)} stores")
+        
+        return ListStoresResponse(
+            stores=stores,
+            total_count=len(stores),
+            current_store=app_state.get("store_name")
+        )
+        
+    except Exception as e:
+        logger.error(f"Error listing stores: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/stores/current", response_model=StoreInfo)
+def get_current_store():
+    """
+    Get information about the currently active File Search store.
+    Strictly follows Google's File Search documentation.
+    """
+    if not app_state["ready"]:
+        raise HTTPException(status_code=503, detail="RAG system is not ready yet. Please wait.")
+    
+    client = app_state["client"]
+    store_name = app_state["store_name"]
+    
+    if not client or not store_name:
+        raise HTTPException(status_code=500, detail="RAG system configuration failed.")
+    
+    try:
+        logger.info(f"Getting info for current store: {store_name}")
+        
+        # Strictly following documentation: get store by name
+        store = client.file_search_stores.get(name=store_name)
+        
+        return StoreInfo(
+            name=store.name,
+            display_name=store.display_name or "Unknown",
+            active_documents_count=store.active_documents_count,
+            pending_documents_count=store.pending_documents_count,
+            failed_documents_count=store.failed_documents_count,
+            size_bytes=store.size_bytes,
+            create_time=str(store.create_time) if store.create_time else None,
+            update_time=str(store.update_time) if store.update_time else None
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting store info: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.delete("/files/delete/{document_id}", response_model=DeleteFileResponse)
 def delete_file(document_id: str):
     """
@@ -317,6 +411,58 @@ def delete_file(document_id: str):
         
     except Exception as e:
         logger.error(f"Error deleting document {document_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/stores/delete/{store_id}", response_model=DeleteStoreResponse)
+def delete_store(store_id: str):
+    """
+    Delete a File Search store.
+    
+    Args:
+        store_id: The ID of the store (e.g., 'fastapiknowledgebase-32kyzpqzre6x')
+                 Do NOT include 'fileSearchStores/' prefix.
+    
+    Note: This will delete the store and ALL its documents.
+          Use force=True to ensure complete deletion.
+    """
+    if not app_state["ready"]:
+        raise HTTPException(status_code=503, detail="RAG system is not ready yet.")
+    
+    client = app_state["client"]
+    
+    if not client:
+        raise HTTPException(status_code=500, detail="RAG system configuration failed.")
+    
+    try:
+        # Construct the full store name as per documentation
+        # Format: fileSearchStores/{store_id}
+        full_store_name = f"fileSearchStores/{store_id}"
+        
+        logger.info(f"Deleting store: {full_store_name}")
+        
+        # Strictly following documentation: delete store with force=True
+        # force=True will delete the store along with all its documents
+        client.file_search_stores.delete(
+            name=full_store_name,
+            config={'force': True}
+        )
+        
+        logger.info(f"Successfully deleted store: {full_store_name}")
+        
+        # If the deleted store is the current one, clear the app state
+        if app_state.get("store_name") == full_store_name:
+            logger.warning("Deleted the current active store. Please restart the server.")
+            app_state["store_name"] = None
+            app_state["ready"] = False
+        
+        return DeleteStoreResponse(
+            success=True,
+            message=f"Store {store_id} and all its documents deleted successfully",
+            store_name=full_store_name
+        )
+        
+    except Exception as e:
+        logger.error(f"Error deleting store {store_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/query", response_model=QueryResponse)

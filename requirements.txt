@@ -3,3 +3,4 @@ uvicorn
 google-genai>=0.8.3
 pydantic
 python-multipart
+python-dotenv
