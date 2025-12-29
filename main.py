@@ -7,10 +7,12 @@ from contextlib import asynccontextmanager
 from typing import List, Optional
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
+from jose import jwt, JWTError
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
@@ -28,10 +30,38 @@ API_KEY_ENV_VAR = "GOOGLE_API_KEY"
 MODEL_ID = "gemini-2.5-flash"
 MAX_CONVERSATION_MESSAGES = 50  # Limit conversation history sent to Gemini
 
+# System Prompt for the AI Assistant
+SYSTEM_PROMPT = """You are a Nursing Information Assistant specialized in nursing education, regulations, and administrative guidance (not a clinician).
+
+Persona & Purpose:
+- You are professional, concise, and compassionate.
+- Your goal is to help users find accurate information about nursing colleges, regulatory guidance, enrollment, recognition, fees, circulars, and administrative procedures in India (and specifically Tamil Nadu) using the provided context.
+
+Behavioral Rules / Constraints:
+- Always base your answers on the provided Context. Do not hallucinate facts that are not present in the Context. If the answer is not in the Context, say you don't know and suggest where the user might look or ask to broaden the search.
+- Do NOT provide medical diagnosis, treatment plans, or clinical advice. If asked for clinical guidance, politely refuse and recommend consulting a licensed healthcare professional.
+- When the Context contains source URLs or document titles, include a short "Sources:" section at the end listing the source URLs or titles you used (one-line entries).
+- If the user query is ambiguous or missing important details, ask one clarifying question before answering.
+- Keep answers clear and concise (prefer 2–6 short paragraphs or bullet points for steps).
+
+Style and Formatting:
+- Use plain language appropriate for nurses, students, or administrators.
+- For procedural steps, use numbered lists. For policies or explanations, use short paragraphs and bold the conclusion line (if applicable).
+- When giving dates, cite the document or circular from the Context that contains the date.
+
+Safety and Tone:
+- Respect privacy: do not ask for or request personal health information beyond what is necessary to answer an administrative or educational question.
+- If the user asks for licensing or legal advice, provide general information only and recommend contacting the Tamil Nadu Nursing Council or another official regulatory body.
+"""
+
 # Supabase Configuration
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")  # From Supabase Dashboard > Settings > API
 supabase: Client = None
+
+# Security
+security = HTTPBearer()
 
 # Global state to hold the client and store name
 app_state = {
@@ -39,6 +69,58 @@ app_state = {
     "store_name": None,
     "ready": False
 }
+
+# ==================== AUTHENTICATION ====================
+
+import httpx
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """
+    Verify Supabase JWT by calling Supabase Auth server.
+    This is the recommended approach as it works with any JWT signing algorithm.
+    Returns dict with user_id and email.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.error("Supabase credentials not configured")
+        raise HTTPException(status_code=500, detail="Authentication not configured")
+    
+    token = credentials.credentials
+    logger.debug(f"Verifying JWT token via Supabase Auth server...")
+    
+    try:
+        # Verify JWT by calling Supabase Auth server
+        response = httpx.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "apikey": SUPABASE_KEY
+            },
+            timeout=10.0
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Auth server returned {response.status_code}: {response.text}")
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        
+        user_data = response.json()
+        user_id = user_data.get("id")
+        
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token: missing user ID")
+        
+        logger.info(f"Authenticated user: {user_id}")
+        return {
+            "user_id": user_id,
+            "email": user_data.get("email"),
+            "role": user_data.get("role", "authenticated")
+        }
+        
+    except httpx.RequestError as e:
+        logger.error(f"Failed to verify token with Auth server: {e}")
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+    except Exception as e:
+        logger.error(f"JWT verification failed: {e}")
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 def get_api_key():
     """Retrieves the API key from the environment."""
@@ -150,7 +232,8 @@ async def lifespan(app: FastAPI):
     # if app_state["client"] and app_state["store_name"]:
     #     app_state["client"].file_search_stores.delete(name=app_state["store_name"])
 
-app = FastAPI(lifespan=lifespan, title="Gemini RAG API")
+# IMPORTANT: redirect_slashes=False prevents 307 redirects that lose Authorization headers
+app = FastAPI(lifespan=lifespan, title="Gemini RAG API", redirect_slashes=False)
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -245,6 +328,10 @@ class ChatResponse(BaseModel):
     sources: List[str] = []
     title: Optional[str] = None
 
+class UserResponse(BaseModel):
+    user_id: str
+    email: Optional[str] = None
+
 @app.get("/")
 def root():
     """Redirect to chat UI"""
@@ -253,6 +340,14 @@ def root():
 @app.get("/health")
 def health_check():
     return {"status": "ok", "rag_ready": app_state["ready"]}
+
+@app.get("/me", response_model=UserResponse)
+def get_current_user_info(current_user: dict = Depends(get_current_user)):
+    """Get the current authenticated user's information."""
+    return UserResponse(
+        user_id=current_user["user_id"],
+        email=current_user.get("email")
+    )
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_file(file: UploadFile = File(...)):
@@ -597,13 +692,15 @@ def build_conversation_history(conversation_id: str, limit: int = MAX_CONVERSATI
         return []
 
 @app.get("/conversations", response_model=ConversationsListResponse)
-def list_conversations():
-    """List all conversations, ordered by most recent."""
+def list_conversations(current_user: dict = Depends(get_current_user)):
+    """List all conversations for the authenticated user, ordered by most recent."""
     if not supabase:
         raise HTTPException(status_code=503, detail="Database not configured")
     
     try:
-        response = supabase.table("conversations").select("*").order("updated_at", desc=True).execute()
+        response = supabase.table("conversations").select("*").eq(
+            "user_id", current_user["user_id"]
+        ).order("updated_at", desc=True).execute()
         
         conversations = [
             ConversationResponse(
@@ -624,14 +721,15 @@ def list_conversations():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/conversations", response_model=ConversationResponse)
-def create_conversation(request: ConversationCreate):
-    """Create a new conversation."""
+def create_conversation(request: ConversationCreate, current_user: dict = Depends(get_current_user)):
+    """Create a new conversation for the authenticated user."""
     if not supabase:
         raise HTTPException(status_code=503, detail="Database not configured")
     
     try:
         response = supabase.table("conversations").insert({
-            "title": request.title
+            "title": request.title,
+            "user_id": current_user["user_id"]
         }).execute()
         
         conv = response.data[0]
@@ -646,25 +744,36 @@ def create_conversation(request: ConversationCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/conversations/{conversation_id}")
-def delete_conversation(conversation_id: str):
-    """Delete a conversation and all its messages."""
+def delete_conversation(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Delete a conversation and all its messages (only if owned by user)."""
     if not supabase:
         raise HTTPException(status_code=503, detail="Database not configured")
     
     try:
-        supabase.table("conversations").delete().eq("id", conversation_id).execute()
+        # Delete only if user owns the conversation
+        supabase.table("conversations").delete().eq(
+            "id", conversation_id
+        ).eq("user_id", current_user["user_id"]).execute()
         return {"success": True, "message": "Conversation deleted"}
     except Exception as e:
         logger.error(f"Error deleting conversation: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/conversations/{conversation_id}/messages", response_model=MessagesListResponse)
-def get_conversation_messages(conversation_id: str):
-    """Get all messages for a conversation."""
+def get_conversation_messages(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Get all messages for a conversation (only if owned by user)."""
     if not supabase:
         raise HTTPException(status_code=503, detail="Database not configured")
     
     try:
+        # First verify the user owns this conversation
+        conv_check = supabase.table("conversations").select("id").eq(
+            "id", conversation_id
+        ).eq("user_id", current_user["user_id"]).execute()
+        
+        if not conv_check.data:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
         response = supabase.table("messages").select("*").eq(
             "conversation_id", conversation_id
         ).order("created_at", desc=False).execute()
@@ -690,7 +799,7 @@ def get_conversation_messages(conversation_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest):
+def chat(request: ChatRequest, current_user: dict = Depends(get_current_user)):
     """
     Send a message and get a response.
     Saves both user message and assistant response to database.
@@ -708,7 +817,17 @@ def chat(request: ChatRequest):
     if not client or not store_name:
         raise HTTPException(status_code=500, detail="RAG system configuration failed.")
     
+    user_id = current_user["user_id"]
+    
     try:
+        # 0. Verify user owns this conversation
+        conv_check = supabase.table("conversations").select("id").eq(
+            "id", request.conversation_id
+        ).eq("user_id", user_id).execute()
+        
+        if not conv_check.data:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
         # 1. Fetch existing conversation history BEFORE saving new message
         conversation_history = build_conversation_history(
             request.conversation_id, 
@@ -721,6 +840,7 @@ def chat(request: ChatRequest):
         # 3. Save user message to database
         supabase.table("messages").insert({
             "conversation_id": request.conversation_id,
+            "user_id": user_id,
             "role": "user",
             "content": request.message,
             "sources": []
@@ -744,7 +864,7 @@ def chat(request: ChatRequest):
         generate_config = types.GenerateContentConfig(
             tools=[tool],
             temperature=0.7,
-            system_instruction="You are a friendly and helpful AI assistant. Your goal is to answer the user's questions naturally and conversationally, as if you were a human expert explaining the topic. Use the provided context to answer accurately, but avoid sounding like a robot or just listing facts. Engage with the user."
+            system_instruction=SYSTEM_PROMPT
         )
         
         logger.info(f"Processing chat with {len(conversation_contents)} messages in context")
@@ -766,6 +886,7 @@ def chat(request: ChatRequest):
         # 6. Save assistant response to database
         supabase.table("messages").insert({
             "conversation_id": request.conversation_id,
+            "user_id": user_id,
             "role": "assistant",
             "content": answer,
             "sources": sources
@@ -819,7 +940,7 @@ def query_model(request: QueryRequest):
         generate_config = types.GenerateContentConfig(
             tools=[tool],
             temperature=0.7,
-            system_instruction="You are a friendly and helpful AI assistant. Your goal is to answer the user's questions naturally and conversationally, as if you were a human expert explaining the topic. Use the provided context to answer accurately, but avoid sounding like a robot or just listing facts. Engage with the user."
+            system_instruction=SYSTEM_PROMPT
         )
         
         logger.info(f"Processing query: {request.query}")

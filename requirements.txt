@@ -2,6 +2,8 @@ fastapi
 uvicorn
 google-genai>=0.8.3
 pydantic
+pydantic-settings
 python-multipart
 python-dotenv
 supabase
+python-jose[cryptography]
